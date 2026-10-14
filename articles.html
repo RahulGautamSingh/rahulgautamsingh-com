@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Articles | Rahul Gautam Singh</title>
+<meta name="description" content="Engineering writing by Rahul Gautam Singh.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<div class="layout">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <a href="index.html">Rahul Gautam Singh</a>
+      <small>Full-Stack AI Engineer</small>
+    </div>
+    <nav>
+      <ul>
+        <li><a href="index.html">About me</a></li>
+        <li><a href="articles.html" aria-current="page">Articles</a></li>
+      </ul>
+    </nav>
+    <footer>Delhi, India<br>Open to remote, worldwide</footer>
+  </aside>
+
+  <main>
+    <div class="wrap">
+      <h1>Articles</h1>
+      <p class="lede">Notes on things I&rsquo;ve built and broken.</p>
+
+      <ul class="post-list">
+        <li>
+          <h3><a href="articles/renovate-clone-reduction.html">The bot that cloned your repo to find out it had nothing to do</a></h3>
+          <div class="meta">Published August 2022 &middot; Updated February 2023</div>
+          <p>Renovate had a cache built to avoid cloning repositories, and cloned them anyway,
+          partly in order to write the cache. A series of small PRs cut clones on the hosted app
+          by 40 to 50 percent, almost none of which made anything faster.</p>
+        </li>
+        <li>
+          <h3><a href="articles/llm-inference-cost.html">Cutting LLM inference cost by 70% in a six-step agentic pipeline</a></h3>
+          <div class="meta">September 2026</div>
+          <p>Chained LLM calls re-send everything that came before, so input-token cost grows with the
+          square of the step count. Two changes fixed it.</p>
+        </li>
+      </ul>
+    </div>
+  </main>
+
+</div>
+</body>
+</html>

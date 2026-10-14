@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cutting LLM inference cost by 70% | Rahul Gautam Singh</title>
+<meta name="description" content="Why chained LLM calls bloat input tokens quadratically, and the two changes that cut our inference bill by 70%.">
+<link rel="stylesheet" href="../style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<div class="layout">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <a href="../index.html">Rahul Gautam Singh</a>
+      <small>Full-Stack AI Engineer</small>
+    </div>
+    <nav>
+      <ul>
+        <li><a href="../index.html">About me</a></li>
+        <li><a href="../articles.html" aria-current="page">Articles</a></li>
+      </ul>
+    </nav>
+    <footer>Delhi, India<br>Open to remote, worldwide</footer>
+  </aside>
+
+  <main>
+    <article>
+      <h1>Cutting LLM inference cost by 70% in a six-step agentic pipeline</h1>
+      <p class="meta">September 2026</p>
+
+      <div class="callout">
+        <strong>Draft.</strong> The mechanism below is right, but the specifics are mine to fill in:
+        the actual step names, the real before/after token counts, and the incident that prompted the
+        audit. Delete this box before publishing.
+      </div>
+
+      <p>We ran a supplier-discovery pipeline at Unibloom: a user asks a question, and a chain of
+      Next.js server actions turns it into search queries, fetches and scrapes candidate pages with
+      Firecrawl and Exa, extracts structured facts with an LLM, cross-checks them, and writes an
+      answer. Five to six steps, each with its own system prompt, output schema, tool-call limit and
+      set of callable functions.</p>
+
+      <p>It worked. It was also far more expensive than it had any right to be, and the reason turned
+      out to be boring: we were paying to send the same text to the model over and over.</p>
+
+      <h2>Input tokens are the bill</h2>
+
+      <p>The intuition that gets people into trouble is thinking of an agentic pipeline as a
+      conversation. It isn't. Each step is a stateless HTTP call, and you are billed for every input
+      token on every call. The model doesn't remember step&nbsp;1, you re-send it.</p>
+
+      <p>So if each step naively carries forward everything that came before, step&nbsp;<em>n</em>
+      pays for the output of steps 1 through <em>n</em>&minus;1, plus every system prompt along the
+      way. The total isn't proportional to the number of steps. It's proportional to the
+      <em>square</em> of it.</p>
+
+      <p>Take a pipeline where each step adds roughly 2,000 tokens of context and carries everything
+      forward:</p>
+
+      <table>
+        <thead>
+          <tr><th>Step</th><th class="num">Carried forward</th><th class="num">Billed input</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td class="num">0</td><td class="num">2,000</td></tr>
+          <tr><td>2</td><td class="num">2,000</td><td class="num">4,000</td></tr>
+          <tr><td>3</td><td class="num">4,000</td><td class="num">6,000</td></tr>
+          <tr><td>4</td><td class="num">6,000</td><td class="num">8,000</td></tr>
+          <tr><td>5</td><td class="num">8,000</td><td class="num">10,000</td></tr>
+          <tr><td>6</td><td class="num">10,000</td><td class="num">12,000</td></tr>
+          <tr><td colspan="2"><strong>Total</strong></td><td class="num"><strong>42,000</strong></td></tr>
+        </tbody>
+      </table>
+
+      <p>Twelve thousand tokens of actual content, billed as forty-two thousand. The extra thirty
+      thousand buys you nothing, it is the same text, re-sent. Add a step and you don't add
+      2,000 tokens, you add 14,000.</p>
+
+      <p>This is invisible in development. You test with two steps and a short document, the bill is
+      cents, and the shape of the curve never shows itself. It shows itself in production, on real
+      documents, at real volume.</p>
+
+      <h2>Fix one: stop resending system prompts</h2>
+
+      <p>Each stage of our pipeline had its own system prompt, the scraper's instructions, the
+      extractor's schema rules, the cross-checker's adjudication policy. Reasonable. The mistake was
+      appending each new one to the accumulated message list rather than replacing it.</p>
+
+      <p>By the last step, the model was receiving five sets of instructions, four of which described
+      jobs that were already finished. That is worse than waste. Stale instructions compete with the
+      current ones, and a model told five different things about output format will sometimes pick
+      the wrong one.</p>
+
+      <p>The fix is to treat the system prompt as belonging to the step, not to the chain:</p>
+
+      <pre><code>// before: instructions accumulate
+messages = [...messages, { role: 'system', content: stepPrompt }, userTurn]
+
+// after: each step gets exactly its own instructions
+messages = [{ role: 'system', content: stepPrompt }, ...carriedContext, userTurn]</code></pre>
+
+      <p>One line of difference. On a six-step chain it removes five redundant prompt copies from the
+      final call, and four from the one before it.</p>
+
+      <h2>Fix two: pass forward the answer, not the transcript</h2>
+
+      <p>The larger win. Every step produced structured output, and we were carrying all of it into
+      the next step on the theory that context is good and the model can ignore what it doesn't need.</p>
+
+      <p>You are paying for that ignoring. If step&nbsp;3 scraped eight pages and produced 6,000
+      tokens of extracted content, and step&nbsp;4 only needs the three supplier names, then 5,800 of
+      those tokens are being bought purely so the model can skip past them.</p>
+
+      <p>So we went through the chain and asked one question at each boundary: <em>what does the next
+      step actually read?</em> Almost everywhere the answer was a small structured subset:
+      a few identifiers, a confidence score, a short list, not the prose the previous step had
+      generated on its way there.</p>
+
+      <p>Because every stage already had an output schema, the trimming had a natural place to live.
+      The schema stopped being only a validation boundary and became a budget: whatever isn't in it
+      doesn't travel.</p>
+
+      <blockquote>Intermediate output is scaffolding. It exists to get the next step built, and then
+      it should come down.</blockquote>
+
+      <h2>What the two changes did together</h2>
+
+      <p>Roughly 70% off inference cost, with no change to output quality. The pipeline still does the
+      same six steps, still reads the same pages, still returns the same answers.</p>
+
+      <p>The split between the two fixes is worth naming: prompt hygiene is the tidier problem and the
+      smaller win, because system prompts are short. Trimming intermediate outputs is where the money
+      was, because scraped page content is long and it was being re-sent four or five times over.</p>
+
+      <p>A small side effect we didn't plan for: latency improved too. Fewer input tokens is less to
+      transfer and less to prefill, and on the longest chains that was noticeable.</p>
+
+      <h2>What I'd tell someone starting this</h2>
+
+      <ul>
+        <li><strong>Log input tokens per step, not per request.</strong> A single aggregate number
+        hides the quadratic shape completely. Per-step, the growth is obvious on the first chart you
+        draw.</li>
+        <li><strong>Suspect the longest step boundary first.</strong> Cost concentrates wherever a
+        step produces bulk text: scraped pages, retrieved documents, tool output.</li>
+        <li><strong>Treat the output schema as the contract for what travels.</strong> If it isn't in
+        the schema, the next step shouldn't see it. This is the discipline that keeps the fix from
+        rotting as the pipeline grows.</li>
+        <li><strong>Re-check after every new step.</strong> The whole problem is that adding a step
+        costs more than the step itself. That stays true after you fix it, the constant is
+        just smaller.</li>
+      </ul>
+
+      <p>None of this is clever. It's the LLM equivalent of noticing you're doing a database query
+      inside a loop. But the pricing model makes it expensive in a way that ordinary redundant work
+      isn't, and nothing in the developer experience points at it. The code that carries
+      everything forward is the code that reads most naturally.</p>
+
+      <p class="meta" style="margin-top:44px">
+        <a href="../articles.html">&larr; All articles</a>
+      </p>
+    </article>
+  </main>
+
+</div>
+</body>
+</html>

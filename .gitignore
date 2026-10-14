@@ -1,0 +1,5 @@
+.DS_Store
+*.bak
+*.md.bak
+# full-resolution meme sources; the site ships the compressed jpgs
+images/originals/

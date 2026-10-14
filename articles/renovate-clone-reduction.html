@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The bot that cloned your repo to find out it had nothing to do | Rahul Gautam Singh</title>
+<meta name="description" content="A case study in deleting work instead of speeding it up. Renovate, 2022 to 2023.">
+<link rel="stylesheet" href="../style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<div class="layout">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <a href="../index.html">Rahul Gautam Singh</a>
+      <small>Full-Stack AI Engineer</small>
+    </div>
+    <nav>
+      <ul>
+        <li><a href="../index.html">About me</a></li>
+        <li><a href="../articles.html" aria-current="page">Articles</a></li>
+      </ul>
+    </nav>
+    <footer>Delhi, India<br>Open to remote, worldwide</footer>
+  </aside>
+
+  <main>
+    <article>
+      <h1>The bot that cloned your repo to find out it had nothing to do</h1>
+
+      <p class="meta">Published August 2022 · Updated 14 February 2023 · @Rahul Gautam Singh</p>
+
+      <p><em>A case study in deleting work instead of speeding it up. Renovate, 2022 to 2023.</em></p>
+
+      <p><strong>TL;DR.</strong> During my internship at Mend in May to July 2022, I shipped a series of small PRs that let Renovate decide from its cache alone that a repository had nothing to do, instead of cloning it to find out. When Rhys Arkins and I measured it on the hosted app at the time, clones dropped by roughly 40 to 50 percent. By early 2023, Rhys reported the hosted app skipping <code>git clone</code> on 50 to 70 percent of runs. Almost none of these changes made anything faster. They made things stop happening.</p>
+
+      <p>My PRs are listed at the end if you want to skip straight to the code.</p>
+
+      <h2>What Renovate does every run</h2>
+
+      <p>Renovate is the dependency update bot. Point it at a repo and it opens PRs whenever a dependency has a new version. For each repo it runs a pipeline: read the config, extract dependencies, look up versions, then for every pending update decide whether a branch and PR need creating, updating, or leaving alone.</p>
+
+      <p>The hosted app at Mend ran this loop across a very large number of repositories, many of them hourly. Most of those runs found nothing new. Same base commit as last time, same open PRs, same versions upstream. The correct amount of work for such a run is roughly zero.</p>
+
+      <p>We were cloning the repo anyway. Worse, once we had cloned it we were regenerating lock files for branches that already had the right lock file.</p>
+
+      <h2>Why the clone kept happening</h2>
+
+      <p>Two pieces of infrastructure already existed when I started on this in May 2022, both designed by Rhys Arkins years earlier.</p>
+
+      <p>The first is lazy git. Since July 2020, <code>initRepo</code> no longer cloned. Instead every function in <code>lib/util/git/index.ts</code> that needs a working tree begins with <code>await syncGit()</code>, which clones on first call and is a no-op afterwards. If nobody calls it, no clone.</p>
+
+      <p>The second is the repository cache, added in June 2020. It persists between runs and stores, among other things, the base branch SHA and the last extract result. If the base branch has not moved, extraction is skipped and its cached result reused. For a repo with no open Renovate branches, this already avoided the clone.</p>
+
+      <p>The trouble started the moment a repo had even one Renovate branch. Then three things forced git work on every run:</p>
+
+      <ol>
+        <li><strong>Every branch state check called git before it looked at anything else.</strong> <code>isBranchModified</code>, <code>isBranchStale</code> (now <code>isBranchBehindBase</code>) and <code>isBranchConflicted</code> all opened with <code>await syncGit()</code>. Asking &quot;has a human pushed to this branch?&quot; meant cloning the repo to find out.</li>
+        <li><strong>Writing the cache itself needed git.</strong> At the end of each run, <code>setBranchCache</code> looped over every branch and called <code>getBranchParentSha</code> and <code>isBranchModified</code> to fill in the cache entry. Both went straight to git. So even a run that had otherwise done nothing would clone, purely so it could record that it had done nothing.</li>
+        <li><strong>Every existing branch was rebuilt from scratch.</strong> <code>processBranch</code> checked out the base branch, re-applied the version bumps, regenerated lock files, ran post-upgrade commands, and only then discovered the result was byte-identical to what was already on the branch. Regenerating a lock file means installing the package manager and running it. For a Poetry or Go modules repo, that means installing the toolchain in a sidecar container and running <code>poetry update --lock</code> or <code>go get</code>, which is not a cheap way to learn that nothing changed.</li>
+      </ol>
+
+      <p>Cache present, cache populated, cache ignored until after the expensive part.</p>
+
+      <figure class="meme">
+        <img src="../images/gru-plan.jpg" alt="Gru&#x27;s four-panel plan. Build a repository cache so we never clone needlessly. Store every branch&#x27;s state in it. Clone the repo to write that state. Gru stares at the last card again." loading="lazy">
+      </figure>
+
+      <h2>Step one: a one line move</h2>
+
+      <p>The first PR was tiny. <a href="https://github.com/renovatebot/renovate/pull/16246">#16246</a>, merged 1 July 2022, moved a single <code>await checkoutBranch(config.baseBranch)</code> in <code>processBranch</code> from the top of the function to after the schedule check. Net diff: two lines added, three removed.</p>
+
+<pre><code>// before (simplified)
+export async function processBranch(branchConfig) {
+  await checkoutBranch(config.baseBranch);   // git, every branch, every run
+  let branchExists = gitBranchExists(config.branchName);
+  ...
+  if (!isScheduledNow(config)) return { result: &#x27;not-scheduled&#x27; };
+
+// after (simplified)
+export async function processBranch(branchConfig) {
+  let branchExists = gitBranchExists(config.branchName);
+  ...
+  if (!isScheduledNow(config)) return { result: &#x27;not-scheduled&#x27; };
+  await checkoutBranch(config.baseBranch);   // only if we got this far</code></pre>
+
+      <p>On my laptop <code>checkoutBranch</code> took 300 to 500 ms. Multiply that by the number of branches in a busy repo and it adds up. The interesting part, though, was what Rhys asked in review: could it move even later, and could I prove that a repo whose updates were all out of schedule now finished a run without cloning at all? I tested with <code>repositoryCache=enabled</code>, ran twice, and posted the debug log. No clone.</p>
+
+      <p>That review comment reframed the whole project. The goal was never &quot;make the checkout faster.&quot; It was &quot;do not touch git unless the run has already decided it needs to.&quot;</p>
+
+      <h2>Step two: check the cache, then sync</h2>
+
+      <p>The next four PRs, all in July 2022, applied one pattern to every branch state function: look at the cache first, and call <code>syncGit()</code> only on a miss. <code>isBranchModified</code> shows it best, because it needed a cache that did not exist yet.</p>
+
+      <p>The function checked an in-process map, but that map was empty at the start of every run, so the first call per branch always went to git. In <a href="https://github.com/renovatebot/renovate/pull/16533">#16533</a> I added <code>modified-cache.ts</code>, keyed on branch name plus the branch SHA, so a cached answer is trusted only if nobody has pushed to the branch since.</p>
+
+<pre><code>export async function isBranchModified(branchName: string): Promise&lt;boolean&gt; {
+  if (!branchExists(branchName)) return false;
+  // First check local config
+  if (config.branchIsModified[branchName] !== undefined) {
+    return config.branchIsModified[branchName];
+  }
+  // Second check repoCache
+  const isModified = getCachedModifiedResult(branchName, config.branchCommits[branchName]);
+  if (isModified !== null) {
+    return (config.branchIsModified[branchName] = isModified);
+  }
+  await syncGit();   // was line 1
+  ...</code></pre>
+
+      <p>The other three followed the same shape:</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>What answers it from cache</th><th>PR</th></tr></thead>
+        <tbody><tr><td><code>isBranchConflicted</code></td><td>Sergei Zharinov&#x27;s conflicts cache (Jan 2022), which was consulted only after <code>syncGit()</code>. I moved two lines below the cache check.</td><td><a href="https://github.com/renovatebot/renovate/pull/16517">#16517</a></td></tr><tr><td><code>isBranchBehindBase</code></td><td>The branch&#x27;s cached parent SHA compared with the current base SHA. Different SHAs means the base moved. The old git command stayed as a fallback.</td><td><a href="https://github.com/renovatebot/renovate/pull/16595">#16595</a></td></tr><tr><td><code>getBranchParentSha</code></td><td>The cached parent SHA if the branch SHA is unchanged, otherwise <code>git rev-parse &lt;sha&gt;^</code>.</td><td><a href="https://github.com/renovatebot/renovate/pull/16724">#16724</a></td></tr></tbody>
+      </table>
+
+      <p>Keeping the fallback in <code>isBranchBehindBase</code> was Rhys&#x27;s call: &quot;We know it works, and it&#x27;s best to do things in incremental steps.&quot; He replaced it with <code>git rev-list --count</code> in March 2023. The <code>getBranchParentSha</code> change also fixed a real bug. On out-of-schedule branches we never cloned, but the cache writer still called this function, which then failed with <code>fatal: not a git repository</code>. Reading from cache first made that error path disappear.</p>
+
+      <p>Three of the four are still in <code>lib/util/git/index.ts</code>, in the same order: cache lookup, then <code>syncGit()</code>. <code>getBranchParentSha</code> is gone, for reasons covered in step four. With them in, a branch could get through &quot;is it modified, is it behind, is it conflicted&quot; without git. Then it hit the update block and cloned anyway.</p>
+
+      <h2>Step three: the gate</h2>
+
+      <p>This is the PR that mattered most. I built it during the internship and it took a month of review to land: <a href="https://github.com/renovatebot/renovate/pull/16661">#16661</a>, merged 22 August 2022.</p>
+
+      <p>The question was this. Given an existing branch that is not modified, not behind base and not conflicted, how do we know the files on it are still what Renovate would produce today? The branch SHA tells us the branch has not changed. It does not tell us whether Renovate has changed. A new version of a manager might extract differently. The user might have added a package rule that changes the grouping. The resolved update set might be different.</p>
+
+      <p>The answer was a fingerprint. Back in April (<a href="https://github.com/renovatebot/renovate/pull/14671">#14671</a>) I had added a build step that hashes every manager&#x27;s source and emits a map of manager name to hash. Now, for each branch, we hash the branch&#x27;s upgrade config together with the hashes of every manager involved, and store that alongside the branch in the cache. Next run, recompute and compare.</p>
+
+      <p>If it matches, <code>processBranch</code> skips the whole update block:</p>
+
+<pre><code>// lib/workers/repository/update/branch/index.ts, as merged in #16661
+if (!(config.reuseExistingBranch &amp;&amp; config.skipBranchUpdate)) {
+  await checkoutBranch(config.baseBranch);
+  const res = await getUpdatedPackageFiles(config);
+  ...
+  const additionalFiles = await getAdditionalFiles(config, branchConfig.packageFiles);
+  ...
+  const postUpgradeCommandResults = await executePostUpgradeCommands(config);
+  ...
+}</code></pre>
+
+      <p>Everything inside that block is the expensive part of Renovate: the checkout, rewriting package files, regenerating lock files with the real package manager, running post-upgrade commands. When the gate closes, none of it runs. And because the checks before it were now all cache-backed, the entire branch could be processed with zero git calls. That was the point of doing steps one and two first. Without them, the gate would have closed on a repo that had already been cloned.</p>
+
+      <p>The review thread is worth reading if you want to see how caching decisions get made in a project that runs on other people&#x27;s repositories. Rhys made me enumerate every state: cache disabled, cache enabled with no branch and nothing created, no branch and something created, branch exists and nothing to do, branch exists and updated. He insisted the fingerprint be written only on runs where a commit actually happened, never speculatively. Michael Kriese asked why the hash was computed so late and whether the existing extract hash could be reused. It could not, because that hash was repo level and this one had to be per branch, but his question is why the two ended up sharing the <code>fingerprint</code> naming.</p>
+
+      <p>One line from my own comments in that thread has aged well: &quot;Currently we clone in case of changes which are only related to PR too, would try to prevent cloning in such cases in future.&quot; That became the PR body fingerprint in February 2023.</p>
+
+      <p>The gate is still in main, now spelled <code>config.cacheFingerprintMatch === &#x27;matched&#x27;</code>.</p>
+
+      <figure class="meme">
+        <img src="../images/branch-cache-stops-checkout.jpg" alt="The &quot;bro, not cool&quot; meme. Renovate turns to chase git checkout walking past, and the branch cache puts a hand on his chest to stop him." loading="lazy">
+      </figure>
+
+      <h2>Step four: everything that broke</h2>
+
+      <p>Cache invalidation being one of the two hard problems, this section was inevitable.</p>
+
+      <p>Within 48 hours of #16724, Gabriel Ladzaretti found and fixed two bugs (<a href="https://github.com/renovatebot/renovate/pull/16752">#16752</a>, <a href="https://github.com/renovatebot/renovate/pull/16762">#16762</a>). Both had the same shape: my new caches assumed the repository cache was enabled. When it was disabled, <code>isBranchModified</code> still wrote a partial branch entry, so <code>getCachedBehindBaseResult</code> found an entry with no <code>parentSha</code>, compared <code>undefined</code> to a real SHA, and returned &quot;behind&quot; for every branch. Renovate started rebasing things that did not need rebasing.</p>
+
+      <p>On the day the gate merged, Rhys filed <a href="https://github.com/renovatebot/renovate/issues/17333">&quot;Cached stale status is incorrect&quot;</a> against the Renovate repo itself: a branch that was up to date with main was being reported as stale, rebased, and cloned for nothing. Nine days later a user reported <a href="https://github.com/renovatebot/renovate/issues/17528">Renovate stuck in a loop overwriting a CI bot&#x27;s commits</a>. The root cause in both was that the caches were being updated in the wrong places relative to when commits actually happened. Rhys wrote up a cleaner design in <a href="https://github.com/renovatebot/renovate/issues/17663">#17663</a>: one <code>syncBranchState</code> call at the start of branch processing that invalidates fields based on which SHAs changed, and simple setters afterwards that trust the sync already happened.</p>
+
+      <p>I implemented that design across September to November 2022 (<a href="https://github.com/renovatebot/renovate/pull/17801">#17801</a>, <a href="https://github.com/renovatebot/renovate/pull/17848">#17848</a>, <a href="https://github.com/renovatebot/renovate/pull/17898">#17898</a>, <a href="https://github.com/renovatebot/renovate/pull/18478">#18478</a>, <a href="https://github.com/renovatebot/renovate/pull/18576">#18576</a>). Along the way <code>parentSha</code> went away entirely in favour of a <code>pristine</code> boolean, which Rhys suggested and which is much easier to reason about.</p>
+
+      <p>Two smaller fixes made the gate close more often. Because the fingerprint was only written on a commit, branches created before the gate existed never got one, so <a href="https://github.com/renovatebot/renovate/pull/17393">#17393</a> writes it for existing branches too. And <a href="https://github.com/renovatebot/renovate/pull/18378">#18378</a> narrowed what gets hashed to the upgrade fields, because hashing the whole branch config meant it changed on every trivial edit, such as a label or a schedule, and the gate never closed.</p>
+
+      <p>One more humbling moment. In late October I moved the cache files into <code>util/cache</code>, a pure refactor. Rhys reverted it two days later after seeing efficiency drop in the hosted app. Michael Kriese said it was strange that a file move could change behaviour, and I still think he was right, but that is how carefully clone counts were being watched by then.</p>
+
+      <h2>Step five: the extract cache</h2>
+
+      <p>The extract cache had the opposite problem from the branches: it was too eager to throw itself away. Its validity check was the base branch SHA plus a hash of the entire Renovate config, over 200 fields. Add a label to your PR config, change a schedule, tweak anything, and the cached extract was gone and the repo was cloned to redo it.</p>
+
+      <p>In December 2022 (<a href="https://github.com/renovatebot/renovate/pull/18216">#18216</a>) I pulled the check out into <code>isCacheExtractValid()</code> and replaced the full-config hash with <code>extract-fingerprint-config.ts</code>, which hashes only the fields that affect extraction: enabled managers, custom manager definitions, npmrc settings, and per-manager config. The SHA check stayed as it was. Rhys wired the manager hashes into the same function in February 2023, so a Renovate release that changed how <code>npm</code> extracts invalidates only repos that use <code>npm</code>.</p>
+
+      <p>The same idea got applied to onboarding in April 2023. A repo that had not yet accepted its onboarding PR was cloned on every run to check whether a config file had appeared. <a href="https://github.com/renovatebot/renovate/pull/20733">#20733</a> stores the default branch SHA and the onboarding branch SHA. If neither has moved, nothing can have changed, and the clone is skipped.</p>
+
+      <h2>The numbers</h2>
+
+      <p>I am going to be straight about this. Rhys and I measured the impact on the hosted app at the time, comparing clone counts and run durations before and after. Clones dropped by roughly 40 to 50 percent, and the one-line checkout move alone accounted for about 10 percent. Those numbers lived in our Slack DMs and in p50, p90 and p99 charts on a laptop that no longer exists. The DMs have aged out of Slack, and I have searched every account I own for the charts. They are gone, so treat those figures as recollection.</p>
+
+      <figure class="meme">
+        <img src="../images/flex-tape-trust-me-bro.jpg" alt="Flex Tape meme. A tank labelled &quot;Source?&quot; springs a leak, and I slap a patch labelled &quot;Trust me bro&quot; over it." loading="lazy">
+      </figure>
+
+      <p>What survives in public:</p>
+
+      <ul>
+        <li>The 300 to 500 ms per <code>checkoutBranch</code> call from #16246, measured locally.</li>
+        <li>A debug log of a full run completing with zero clones on a repo with pending, out-of-schedule updates.</li>
+        <li>Rhys&#x27;s statement in a <a href="https://github.com/renovatebot/renovate/discussions/20395#discussioncomment-4970095">14 February 2023 discussion</a>, answering a user who was disappointed with the S3 repository cache: &quot;In the hosted app we see cloning skipped 50-70% of the time, resulting in a \~30% performance improvement compared to when repo cache is off.&quot;</li>
+      </ul>
+
+      <p>That last figure covers the repository cache as a whole, and the extract half of it predates me. But the conditions Rhys lists for skipping a clone are &quot;base branch unchanged&quot; (his 2020 work) and &quot;branch exists with same config and is not conflicted or behind base&quot; (the caches and the gate above). The <code>cloned</code> flag he told that user to look for was added to the end-of-run log four days after the <code>syncBranchState</code> redesign landed. So the 50 to 70 percent was measured on code that includes this work.</p>
+
+      <h2>What I would tell someone doing this today</h2>
+
+      <p><strong>Measure where the time goes before touching anything.</strong> I assumed the expensive part was network calls to registries. It was git, and it was git being called to answer questions the cache could already answer.</p>
+
+      <p><strong>The best performance PR is often a reorder.</strong> Most of the PRs in this story moved existing lines or added a condition around them. Nothing got faster. Things stopped happening.</p>
+
+      <p><strong>Order the cheap checks so the expensive gate can actually close.</strong> The fingerprint gate was worthless while the checks before it still cloned. Steps one and two existed so that step three could pay off.</p>
+
+      <p><strong>Every cache needs a story for &quot;what if the cache is off.&quot;</strong> Both bugs found within two days were on the disabled-cache path. I had only tested with it on.</p>
+
+      <p><strong>Keep the old code as the fallback until the cache has earned trust.</strong> Rhys insisted on this for <code>isBranchBehindBase</code>, and the git fallback stayed for eight months. It meant cache misses degraded to &quot;slower&quot; rather than &quot;wrong.&quot;</p>
+
+      <p>And screenshot your dashboards somewhere that is not a laptop.</p>
+
+      <h2>My PRs in this story</h2>
+
+      <table>
+        <thead><tr><th>Merged</th><th>PR</th><th>What it did</th></tr></thead>
+        <tbody><tr><td>Apr 2022</td><td><a href="https://github.com/renovatebot/renovate/pull/14671">#14671</a></td><td>Build step that hashes each manager&#x27;s source, later used by the fingerprint</td></tr><tr><td>1 Jul 2022</td><td><a href="https://github.com/renovatebot/renovate/pull/16246">#16246</a></td><td>Moved the base branch checkout after the schedule check</td></tr><tr><td>Jul 2022</td><td><a href="https://github.com/renovatebot/renovate/pull/16517">#16517</a></td><td><code>isBranchConflicted</code> reads the cache before syncing git</td></tr><tr><td>Jul 2022</td><td><a href="https://github.com/renovatebot/renovate/pull/16533">#16533</a></td><td>New modified cache for <code>isBranchModified</code></td></tr><tr><td>Jul 2022</td><td><a href="https://github.com/renovatebot/renovate/pull/16595">#16595</a></td><td><code>isBranchBehindBase</code> answered from cached SHAs</td></tr><tr><td>Jul 2022</td><td><a href="https://github.com/renovatebot/renovate/pull/16724">#16724</a></td><td><code>getBranchParentSha</code> from cache, fixing the not-a-git-repo error</td></tr><tr><td>22 Aug 2022</td><td><a href="https://github.com/renovatebot/renovate/pull/16661">#16661</a></td><td>Branch fingerprint gate that skips the whole update block</td></tr><tr><td>Sep to Nov 2022</td><td><a href="https://github.com/renovatebot/renovate/pull/17801">#17801</a>, <a href="https://github.com/renovatebot/renovate/pull/17848">#17848</a>, <a href="https://github.com/renovatebot/renovate/pull/17898">#17898</a>, <a href="https://github.com/renovatebot/renovate/pull/18478">#18478</a>, <a href="https://github.com/renovatebot/renovate/pull/18576">#18576</a></td><td>Implemented the <code>syncBranchState</code> cache redesign</td></tr><tr><td>Dec 2022</td><td><a href="https://github.com/renovatebot/renovate/pull/18216">#18216</a></td><td>Extract cache validity based only on extraction-relevant config</td></tr></tbody>
+      </table>
+      <p class="meta" style="margin-top:44px">
+        <a href="../articles.html">&larr; All articles</a>
+      </p>
+    </article>
+  </main>
+
+</div>
+</body>
+</html>
