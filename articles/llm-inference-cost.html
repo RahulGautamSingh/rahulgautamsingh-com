@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cutting LLM inference cost by 70% | Rahul Gautam Singh</title>
-<meta name="description" content="Why chained LLM calls bloat input tokens quadratically, and the two changes that cut our inference bill by 70%.">
+<title>The agent that paid to re-read its own homework | Rahul Gautam Singh</title>
+<meta name="description" content="How a supplier-discovery tool loop quietly billed us for the same scraped pages five times over, and the three PRs that stopped it.">
 <link rel="stylesheet" href="../style.css">
 <link rel="icon" href="data:,">
 </head>
@@ -27,137 +27,98 @@
 
   <main>
     <article>
-      <h1>Cutting LLM inference cost by 70% in a six-step agentic pipeline</h1>
-      <p class="meta">September 2026</p>
+      <h1>The agent that paid to re-read its own homework</h1>
 
-      <div class="callout">
-        <strong>Draft.</strong> The mechanism below is right, but the specifics are mine to fill in:
-        the actual step names, the real before/after token counts, and the incident that prompted the
-        audit. Delete this box before publishing.
-      </div>
+      <p class="meta">Published October 2026 · @Rahul Gautam Singh</p>
 
-      <p>We ran a supplier-discovery pipeline at Unibloom: a user asks a question, and a chain of
-      Next.js server actions turns it into search queries, fetches and scrapes candidate pages with
-      Firecrawl and Exa, extracts structured facts with an LLM, cross-checks them, and writes an
-      answer. Five to six steps, each with its own system prompt, output schema, tool-call limit and
-      set of callable functions.</p>
+      <p><em>How a supplier-discovery tool loop quietly billed us for the same scraped pages five times over, and the three PRs that stopped it.</em></p>
 
-      <p>It worked. It was also far more expensive than it had any right to be, and the reason turned
-      out to be boring: we were paying to send the same text to the model over and over.</p>
+      <p><strong>TL;DR.</strong> A tool loop budgeted at six model calls was re-sending every previous scrape on every call, so input-token cost grew with the square of the loop length, not linearly. It surfaced as context-limit failures and roughly one dollar per call. Capping scrape size, splitting discovery from enrichment, and finally moving scraping out of the loop entirely took inference cost down by around 70%. None of it made the model faster. It made the model stop re-reading things.</p>
 
-      <h2>Input tokens are the bill</h2>
+      <h2>What the thing does</h2>
 
-      <p>The intuition that gets people into trouble is thinking of an agentic pipeline as a
-      conversation. It isn't. Each step is a stateless HTTP call, and you are billed for every input
-      token on every call. The model doesn't remember step&nbsp;1, you re-send it.</p>
+      <p>At Unibloom we built supplier discovery: you ask for alternatives to a supplier, and an agent goes and finds them. Search the web, scrape the promising pages, return structured candidates with a sustainability profile attached.</p>
 
-      <p>So if each step naively carries forward everything that came before, step&nbsp;<em>n</em>
-      pays for the output of steps 1 through <em>n</em>&minus;1, plus every system prompt along the
-      way. The total isn't proportional to the number of steps. It's proportional to the
-      <em>square</em> of it.</p>
+      <p>It is a tool loop, not a pipeline. The implementation is <code>generateText</code> from the Vercel AI SDK with <code>stopWhen: stepCountIs(...)</code> — six for finding alternatives, five for analysing a current supplier. Models were <code>gpt-5.4-mini</code> and Gemini, through the plain <code>@ai-sdk/openai</code> and <code>@ai-sdk/google</code> providers.</p>
 
-      <p>Take a pipeline where each step adds roughly 2,000 tokens of context and carries everything
-      forward:</p>
+      <h2>What a &quot;step&quot; actually is</h2>
 
-      <table>
-        <thead>
-          <tr><th>Step</th><th class="num">Carried forward</th><th class="num">Billed input</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>1</td><td class="num">0</td><td class="num">2,000</td></tr>
-          <tr><td>2</td><td class="num">2,000</td><td class="num">4,000</td></tr>
-          <tr><td>3</td><td class="num">4,000</td><td class="num">6,000</td></tr>
-          <tr><td>4</td><td class="num">6,000</td><td class="num">8,000</td></tr>
-          <tr><td>5</td><td class="num">8,000</td><td class="num">10,000</td></tr>
-          <tr><td>6</td><td class="num">10,000</td><td class="num">12,000</td></tr>
-          <tr><td colspan="2"><strong>Total</strong></td><td class="num"><strong>42,000</strong></td></tr>
-        </tbody>
-      </table>
+      <p>This is the part worth getting right, because the word invites the wrong picture.</p>
 
-      <p>Twelve thousand tokens of actual content, billed as forty-two thousand. The extra thirty
-      thousand buys you nothing, it is the same text, re-sent. Add a step and you don't add
-      2,000 tokens, you add 14,000.</p>
+      <p>A step is <strong>one model generation</strong>. On each one the model either calls tools — in which case the results are appended to the message history and another step runs — or it emits its final output, which ends the loop early. So <code>stepCountIs(6)</code> does not describe six scripted stages. It says: <em>the model gets at most six generations before it has to answer.</em></p>
 
-      <p>This is invisible in development. You test with two steps and a short document, the bill is
-      cents, and the shape of the curve never shows itself. It shows itself in production, on real
-      documents, at real volume.</p>
-
-      <h2>Fix one: stop resending system prompts</h2>
-
-      <p>Each stage of our pipeline had its own system prompt, the scraper's instructions, the
-      extractor's schema rules, the cross-checker's adjudication policy. Reasonable. The mistake was
-      appending each new one to the accumulated message list rather than replacing it.</p>
-
-      <p>By the last step, the model was receiving five sets of instructions, four of which described
-      jobs that were already finished. That is worse than waste. Stale instructions compete with the
-      current ones, and a model told five different things about output format will sometimes pick
-      the wrong one.</p>
-
-      <p>The fix is to treat the system prompt as belonging to the step, not to the chain:</p>
-
-      <pre><code>// before: instructions accumulate
-messages = [...messages, { role: 'system', content: stepPrompt }, userTurn]
-
-// after: each step gets exactly its own instructions
-messages = [{ role: 'system', content: stepPrompt }, ...carriedContext, userTurn]</code></pre>
-
-      <p>One line of difference. On a six-step chain it removes five redundant prompt copies from the
-      final call, and four from the one before it.</p>
-
-      <h2>Fix two: pass forward the answer, not the transcript</h2>
-
-      <p>The larger win. Every step produced structured output, and we were carrying all of it into
-      the next step on the theory that context is good and the model can ignore what it doesn't need.</p>
-
-      <p>You are paying for that ignoring. If step&nbsp;3 scraped eight pages and produced 6,000
-      tokens of extracted content, and step&nbsp;4 only needs the three supplier names, then 5,800 of
-      those tokens are being bought purely so the model can skip past them.</p>
-
-      <p>So we went through the chain and asked one question at each boundary: <em>what does the next
-      step actually read?</em> Almost everywhere the answer was a small structured subset:
-      a few identifiers, a confidence score, a short list, not the prose the previous step had
-      generated on its way there.</p>
-
-      <p>Because every stage already had an output schema, the trimming had a natural place to live.
-      The schema stopped being only a validation boundary and became a budget: whatever isn't in it
-      doesn't travel.</p>
-
-      <blockquote>Intermediate output is scaffolding. It exists to get the next step built, and then
-      it should come down.</blockquote>
-
-      <h2>What the two changes did together</h2>
-
-      <p>Roughly 70% off inference cost, with no change to output quality. The pipeline still does the
-      same six steps, still reads the same pages, still returns the same answers.</p>
-
-      <p>The split between the two fixes is worth naming: prompt hygiene is the tidier problem and the
-      smaller win, because system prompts are short. Trimming intermediate outputs is where the money
-      was, because scraped page content is long and it was being re-sent four or five times over.</p>
-
-      <p>A small side effect we didn't plan for: latency improved too. Fewer input tokens is less to
-      transfer and less to prefill, and on the longest chains that was noticeable.</p>
-
-      <h2>What I'd tell someone starting this</h2>
+      <p>What happened inside those six was steered entirely by the prompt, which prescribed a loose two-phase method rather than a per-step script:</p>
 
       <ul>
-        <li><strong>Log input tokens per step, not per request.</strong> A single aggregate number
-        hides the quadratic shape completely. Per-step, the growth is obvious on the first chart you
-        draw.</li>
-        <li><strong>Suspect the longest step boundary first.</strong> Cost concentrates wherever a
-        step produces bulk text: scraped pages, retrieved documents, tool output.</li>
-        <li><strong>Treat the output schema as the contract for what travels.</strong> If it isn't in
-        the schema, the next step shouldn't see it. This is the discipline that keeps the fix from
-        rotting as the pipeline grows.</li>
-        <li><strong>Re-check after every new step.</strong> The whole problem is that adding a step
-        costs more than the step itself. That stays true after you fix it, the constant is
-        just smaller.</li>
+        <li>Use the search tool to find promising official supplier pages.</li>
+        <li>Scrape the strongest ones before returning candidates.</li>
+        <li>Return JSON matching the schema, up to six candidates.</li>
       </ul>
 
-      <p>None of this is clever. It's the LLM equivalent of noticing you're doing a database query
-      inside a loop. But the pricing model makes it expensive in a way that ordinary redundant work
-      isn't, and nothing in the developer experience points at it. The code that carries
-      everything forward is the code that reads most naturally.</p>
+      <p>A typical run came out as:</p>
 
+      <ol>
+        <li><strong>Step 1</strong> — the model calls search. Twelve SERP results come back and get appended.</li>
+        <li><strong>Steps 2 to 5</strong> — it calls scrape on the pages it liked, sometimes several in one step since the SDK allows parallel tool calls. Each scrape returned up to <strong>16,000 characters</strong> of raw Firecrawl markdown. All of it appended. It could interleave more searches here too.</li>
+        <li><strong>Final step</strong> — it emits the structured JSON. If it had not finished by step six, the loop was cut off there.</li>
+      </ol>
+
+      <p>So the shape of a run was emergent. Some finished in three generations, some used all six.</p>
+
+      <h2>Why that gets expensive</h2>
+
+      <p>Each step is a fresh, stateless call to the model. Nothing between steps is summarised or dropped. <strong>Step N re-sends everything from steps 1 through N−1</strong>, and you pay input tokens for the whole pile every time.</p>
+
+      <p>By the last generation the model was re-reading the system prompt, the twelve search results, and potentially four or five scrapes at 16,000 characters each. Not because it needed them again, but because that was the context.</p>
+
+      <p>The cost does not scale with the number of steps. It scales with the square of it. A rough illustration, assuming each step adds a similar lump of context:</p>
+
+      <table>
+        <thead><tr><th>Step</th><th>Carried in</th><th>Billed input</th></tr></thead>
+        <tbody><tr><td>1</td><td>0</td><td>1 unit</td></tr><tr><td>2</td><td>1</td><td>2 units</td></tr><tr><td>3</td><td>2</td><td>3 units</td></tr><tr><td>4</td><td>3</td><td>4 units</td></tr><tr><td>5</td><td>4</td><td>5 units</td></tr><tr><td>6</td><td>5</td><td>6 units</td></tr><tr><td></td><td><strong>Total content: 6</strong></td><td><strong>Total billed: 21</strong></td></tr></tbody>
+      </table>
+
+      <p>Six units of actual content, twenty-one units billed. Add a seventh step and you do not add one unit, you add seven.</p>
+
+      <p>This is invisible in development. You test with a short document and two tool calls, the bill is cents, and the curve never shows itself. It shows up in production, on real pages, at real volume.</p>
+
+      <h2>How it surfaced</h2>
+
+      <p>Not as a line on an invoice. It surfaced as <strong>context-limit failures</strong> — runs that simply died because the accumulated history no longer fitted — and as individual calls costing <strong>roughly a dollar</strong>.</p>
+
+      <p>A dollar per supplier query is not a rounding error on a product where querying is the whole point. The failures were the louder signal, but the cost was the one that made it urgent.</p>
+
+      <h2>Three fixes, same multiplier</h2>
+
+      <p>Each attacked the same problem from a different distance.</p>
+
+      <p><strong>Cap the characters per scrape.</strong> The 16,000-character ceiling was generous for a page you read once and absurd for a page you re-read five times. Lowering it cuts every subsequent re-send at the same time. The cheapest change and the first one worth making.</p>
+
+      <p><strong>Split discovery from enrichment.</strong> Instead of one loop that searches, scrapes and composes, two narrower passes that each carry less context. The expensive material stops travelling through generations that have no use for it.</p>
+
+      <p><strong>Move scraping out of the loop entirely.</strong> The real fix. If scraping happens outside the model&#x27;s tool loop, the raw markdown never enters the message history at all. The model gets what it needs to decide, not the pages themselves. The multiplier does not get smaller — it stops existing.</p>
+
+      <p>The same PR made the system prompts static. They had been built per call; as module-level constants they are identical byte-for-byte on every request, which matters for the next point.</p>
+
+      <h2>A caveat about caching</h2>
+
+      <p>We had no explicit prompt-caching code. No <code>cache_control</code>, no <code>cacheControl</code>, no <code>promptCacheKey</code> anywhere in the AI calls. The only <code>cacheControl</code> in the codebase reads an HTTP response header in a URL-validation tool.</p>
+
+      <p>But <strong>&quot;no explicit caching&quot; is not the same as &quot;no caching.&quot;</strong> OpenAI applies automatic server-side prompt caching regardless of what you do, so some of that repeated prefix was already cheaper than list price. Making the system prompts static helps precisely because caching keys on an identical prefix.</p>
+
+      <p>I am making the narrow claim here, not the broad one: we wrote no caching code. What the provider did underneath is theirs, and I did not measure it.</p>
+
+      <h2>What I would tell someone starting this</h2>
+
+      <p><strong>Log input tokens per step, not per call.</strong> A single aggregate number hides the quadratic shape completely. Per step, the growth is obvious on the first chart you draw.</p>
+
+      <p><strong>Find the biggest thing that enters the history and ask whether it has to.</strong> Cost concentrates wherever bulk text joins the context — scraped pages, retrieved documents, long tool output. Everything downstream pays for it, repeatedly.</p>
+
+      <p><strong>Prefer moving work out of the loop over trimming what is in it.</strong> Capping the scrape size was worth doing and it was still a smaller win than taking scraping out of the loop. Trimming reduces the multiplier; removal deletes it.</p>
+
+      <p><strong>Mind the vocabulary.</strong> &quot;Six steps&quot; sounds like six stages of a pipeline. It is a budget of six model generations, and the difference matters when you are reasoning about what gets re-sent.</p>
+
+      <p>None of this is clever. It is the LLM equivalent of noticing a query inside a loop. But the pricing model makes it expensive in a way ordinary redundant work is not, and nothing in the developer experience points at it — the code that carries everything forward is the code that reads most naturally.</p>
       <p class="meta" style="margin-top:44px">
         <a href="../articles.html">&larr; All articles</a>
       </p>

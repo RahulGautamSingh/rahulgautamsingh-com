@@ -39,10 +39,11 @@
           by 40 to 50 percent, almost none of which made anything faster.</p>
         </li>
         <li>
-          <h3><a href="articles/llm-inference-cost.html">Cutting LLM inference cost by 70% in a six-step agentic pipeline</a></h3>
-          <div class="meta">September 2026</div>
-          <p>Chained LLM calls re-send everything that came before, so input-token cost grows with the
-          square of the step count. Two changes fixed it.</p>
+          <h3><a href="articles/llm-inference-cost.html">The agent that paid to re-read its own homework</a></h3>
+          <div class="meta">October 2026</div>
+          <p>A tool loop re-sent every previous scrape on every model call, so cost grew with the
+          square of the loop length. It surfaced as context-limit failures and dollar-a-call queries.
+          Three PRs took inference cost down by around 70%.</p>
         </li>
       </ul>
     </div>
