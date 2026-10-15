@@ -27,7 +27,7 @@ def shell(title, desc, body, depth):
 <title>{html.escape(title)} | Rahul Gautam Singh</title>
 <meta name="description" content="{html.escape(desc)}">
 <link rel="stylesheet" href="{up}style.css">
-<link rel="icon" href="data:,">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">\n<link rel="mask-icon" href="/favicon.svg" color="#9a4f1b">
 </head>
 <body>
 <div class="layout">
