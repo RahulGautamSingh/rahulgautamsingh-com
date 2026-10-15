@@ -2,43 +2,41 @@
 
 Published October 2026 · @Rahul Gautam Singh
 
-*How a supplier-discovery tool loop quietly billed us for the same scraped pages five times over, and the three PRs that stopped it.*
+*A supplier-discovery tool loop re-sent every page it had scraped on every model call. Three weeks and four PRs to stop it, only one of which was mine.*
 
-**TL;DR.** A tool loop budgeted at six model calls was re-sending every previous scrape on every call, so input-token cost grew with the square of the loop length, not linearly. It surfaced as context-limit failures and roughly one dollar per call. Capping scrape size, splitting discovery from enrichment, and finally moving scraping out of the loop entirely took inference cost down by around 70%. None of it made the model faster. It made the model stop re-reading things.
+**TL;DR.** In April 2026 our supplier-discovery agent started failing on context limits and costing around a dollar a call. The cause was structural: in a tool loop, step N re-sends everything from steps 1 to N−1, so when each scrape appends 16,000 characters of raw markdown, cost grows superlinearly with loop length. The fixes came in three waves from two people — cap the scrape size, split discovery from enrichment, then take scraping out of the loop entirely. I own the second one. The numbers below are flagged where they are recollection rather than measurement.
 
-## What the thing does
+## What it does
 
-At Unibloom we built supplier discovery: you ask for alternatives to a supplier, and an agent goes and finds them. Search the web, scrape the promising pages, return structured candidates with a sustainability profile attached.
+At Unibloom, supplier discovery answers "find me alternatives to this supplier." An agent searches the web, scrapes promising pages, and returns structured candidates with a sustainability profile attached — EcoVadis, CDP, SBTi, Scope 3, EUDR, REACH.
 
-It is a tool loop, not a pipeline. The implementation is `generateText` from the Vercel AI SDK with `stopWhen: stepCountIs(...)` — six for finding alternatives, five for analysing a current supplier. Models were `gpt-5.4-mini` and Gemini, through the plain `@ai-sdk/openai` and `@ai-sdk/google` providers.
+It is a tool loop, not a pipeline. `generateText` from the Vercel AI SDK, `stopWhen: stepCountIs(n)`, two tools: search and scrape. Models were `gpt-5.4-mini` and Gemini through the plain `@ai-sdk/openai` and `@ai-sdk/google` providers.
+
+I built that first version in PR #343, merged 2 April 2026, with Shivansh Kumar. The original budgets were six tool steps and a 16,000-character scrape cap for the alternatives flow, five steps and 14,000 characters for analysing a current supplier.
 
 ## What a "step" actually is
 
-This is the part worth getting right, because the word invites the wrong picture.
+Worth getting right, because the word invites the wrong picture.
 
-A step is **one model generation**. On each one the model either calls tools — in which case the results are appended to the message history and another step runs — or it emits its final output, which ends the loop early. So `stepCountIs(6)` does not describe six scripted stages. It says: *the model gets at most six generations before it has to answer.*
+A step is **one model generation**. On each one the model either calls tools — results get appended to the message history and another step runs — or it emits final output, ending the loop early. So `stepCountIs(6)` does not describe six scripted stages. It says *the model gets at most six generations before it has to answer.*
 
-What happened inside those six was steered entirely by the prompt, which prescribed a loose two-phase method rather than a per-step script:
-
-- Use the search tool to find promising official supplier pages.
-- Scrape the strongest ones before returning candidates.
-- Return JSON matching the schema, up to six candidates.
+What happened inside was steered only by the prompt, which gave a loose two-phase method rather than a per-step script: use search to find promising official pages, scrape the strongest ones, then return JSON matching the schema.
 
 A typical run came out as:
 
-1. **Step 1** — the model calls search. Twelve SERP results come back and get appended.
-2. **Steps 2 to 5** — it calls scrape on the pages it liked, sometimes several in one step since the SDK allows parallel tool calls. Each scrape returned up to **16,000 characters** of raw Firecrawl markdown. All of it appended. It could interleave more searches here too.
-3. **Final step** — it emits the structured JSON. If it had not finished by step six, the loop was cut off there.
+1. **Step 1** — call search. Twelve SERP results appended.
+2. **Steps 2 to 5** — call scrape on pages it liked, sometimes several per step since the SDK allows parallel tool calls. Each scrape returned up to 16,000 characters of raw Firecrawl markdown, truncated with a `[Content truncated to N chars]` marker. All appended. It could interleave more searches.
+3. **Final step** — emit the `Output.object` JSON. If it had not finished by six, the loop was cut off there.
 
-So the shape of a run was emergent. Some finished in three generations, some used all six.
+So the shape was emergent. Some runs finished in three generations, some used the lot.
 
 ## Why that gets expensive
 
-Each step is a fresh, stateless call to the model. Nothing between steps is summarised or dropped. **Step N re-sends everything from steps 1 through N−1**, and you pay input tokens for the whole pile every time.
+Each step is a fresh, stateless call. Nothing between steps is summarised or dropped. **Step N re-sends everything from steps 1 through N−1**, and you pay input tokens for the whole pile every time.
 
-By the last generation the model was re-reading the system prompt, the twelve search results, and potentially four or five scrapes at 16,000 characters each. Not because it needed them again, but because that was the context.
+By the last generation the model was re-reading the system prompt, twelve search results, and potentially four or five scrapes at 16,000 characters each. Not because it needed them again. Because that was the context.
 
-The cost does not scale with the number of steps. It scales with the square of it. A rough illustration, assuming each step adds a similar lump of context:
+Cost scales with the square of the loop length, not with it. A rough illustration, assuming each step adds a similar lump:
 
 | Step | Carried in | Billed input |
 | --- | --- | --- |
@@ -48,46 +46,62 @@ The cost does not scale with the number of steps. It scales with the square of i
 | 4 | 3 | 4 units |
 | 5 | 4 | 5 units |
 | 6 | 5 | 6 units |
-| | **Total content: 6** | **Total billed: 21** |
+| | **content: 6** | **billed: 21** |
 
-Six units of actual content, twenty-one units billed. Add a seventh step and you do not add one unit, you add seven.
+Six units of content, twenty-one billed. Add a seventh step and you add seven, not one.
 
-This is invisible in development. You test with a short document and two tool calls, the bill is cents, and the curve never shows itself. It shows up in production, on real pages, at real volume.
+Invisible in development. You test with a short page and two tool calls, the bill is cents, the curve never shows itself.
 
 ## How it surfaced
 
-Not as a line on an invoice. It surfaced as **context-limit failures** — runs that simply died because the accumulated history no longer fitted — and as individual calls costing **roughly a dollar**.
+Not as a line on an invoice. As **context-limit failures** — runs dying because the accumulated history no longer fitted — and calls costing **roughly a dollar**.
 
-A dollar per supplier query is not a rounding error on a product where querying is the whole point. The failures were the louder signal, but the cost was the one that made it urgent.
+Both of those figures are my recollection from the time. See the note on evidence at the end.
 
-## Three fixes, same multiplier
+## Three waves, same multiplier
 
-Each attacked the same problem from a different distance.
+**Cap the scrape, 15 April (PR #411, Shivansh Kumar).** The first and biggest ratchet: alternatives 16,000 → 5,000 characters, current supplier 14,000 → 3,000. Lowering the cap cuts every subsequent re-send at the same time, which is why it was the cheapest effective change available. The same PR added a URL-validation tool so the model stopped scraping dead links.
 
-**Cap the characters per scrape.** The 16,000-character ceiling was generous for a page you read once and absurd for a page you re-read five times. Lowering it cuts every subsequent re-send at the same time. The cheapest change and the first one worth making.
+**Split discovery from enrichment, 17 April (PR #416, mine).** This one I own. Discovery had been returning the full candidate schema — including the whole sustainability profile — from inside the loop that was also doing the scraping. I split the data contract in two: discovery now returns basic candidates (name, URL, location, cost, flags), and a separate enrichment phase returns the sustainability and operational detail keyed by supplier.
 
-**Split discovery from enrichment.** Instead of one loop that searches, scrapes and composes, two narrower passes that each carry less context. The expensive material stops travelling through generations that have no use for it.
+The point was not the schema. It was that expensive evidence-gathering stopped happening inside the discovery loop, so each loop carried less. Enrichment got its own budget: ten steps, six results, 5,000 characters.
 
-**Move scraping out of the loop entirely.** The real fix. If scraping happens outside the model's tool loop, the raw markdown never enters the message history at all. The model gets what it needs to decide, not the pages themselves. The multiplier does not get smaller — it stops existing.
+**Take scraping out of the loop, 22–23 April (PR #421, Shivansh Kumar, with Vinod Kumar and me).** The real fix. Exa does discovery, Firecrawl is called with a nine-field extraction schema, and both run *outside* the model loop. The data contract changed from a raw markdown blob to structured JSON, capped at 4,000 characters per candidate. Analysis then runs as a single `generateText` with no tools at all, over pre-scraped structured data.
 
-The same PR made the system prompts static. They had been built per call; as module-level constants they are identical byte-for-byte on every request, which matters for the next point.
+The model never sees a raw page again. The multiplier does not get smaller — it stops existing.
 
-## A caveat about caching
+## The bit that wasn't monotonic
 
-We had no explicit prompt-caching code. No `cache_control`, no `cacheControl`, no `promptCacheKey` anywhere in the AI calls. The only `cacheControl` in the codebase reads an HTTP response header in a URL-validation tool.
+Between the second and third waves, on 18 April, I raised all three step budgets from ten to fifteen (PR #418) and reworked the tool-usage instructions.
 
-But **"no explicit caching" is not the same as "no caching."** OpenAI applies automatic server-side prompt caching regardless of what you do, so some of that repeated prefix was already cheaper than list price. Making the system prompts static helps precisely because caching keys on an identical prefix.
+That moved step counts *up*, not down. The honest framing is that I traded per-scrape size for more, smaller steps — with a 5,000-character cap, more generations were affordable than they had been at 16,000. The final rewrite brought them back down to eight for enrichment and ten for discovery.
 
-I am making the narrow claim here, not the broad one: we wrote no caching code. What the provider did underneath is theirs, and I did not measure it.
+Cost work does not progress in a straight line, and a write-up that only lists the reductions is a tidier story than the one that happened.
+
+## A caveat on caching
+
+We had no explicit prompt-caching code. No `cache_control`, no `cacheControl`, no `promptCacheKey` in any AI call. `providerOptions` was used only for `{ strictJsonSchema: false }`.
+
+But **"no explicit caching" is not "no caching."** OpenAI applies automatic server-side prompt caching regardless. Making the system prompts static — module-level constants and zero-arg builders, part of the final PR — helps precisely because caching keys on an identical prefix.
+
+I am making the narrow claim, not the broad one.
+
+## What the numbers can and cannot support
+
+The repository contains no token counts, no dollar amounts, no failure rates. The dollar-a-call figure and the overall reduction are my recollection. Where they could be verified: LLM telemetry went into PostHog on 1 April (PR #362, Vinit Sarvade), which predates all of this work, so before-and-after curves would live there. Context-length errors would be queryable in the error table by date and message.
+
+What the code alone supports, without claiming a measurement: worst-case context went from roughly six generations accumulating 16,000 characters of raw markdown each, to a single tool-less call over at most 4,000 characters of structured JSON per candidate. That arithmetic supports a large reduction on its own.
+
+I would rather say that than quote a number I cannot currently reproduce.
 
 ## What I would tell someone starting this
 
-**Log input tokens per step, not per call.** A single aggregate number hides the quadratic shape completely. Per step, the growth is obvious on the first chart you draw.
+**Log input tokens per step, not per call.** A single aggregate hides the quadratic shape completely.
 
-**Find the biggest thing that enters the history and ask whether it has to.** Cost concentrates wherever bulk text joins the context — scraped pages, retrieved documents, long tool output. Everything downstream pays for it, repeatedly.
+**Find the biggest thing entering the history and ask whether it has to be there.** Cost concentrates where bulk text joins the context. Everything downstream pays for it, repeatedly.
 
-**Prefer moving work out of the loop over trimming what is in it.** Capping the scrape size was worth doing and it was still a smaller win than taking scraping out of the loop. Trimming reduces the multiplier; removal deletes it.
+**Prefer moving work out of the loop over trimming what is in it.** Capping the scrape was worth doing and still a smaller win than removing scraping from the loop. Trimming reduces the multiplier; removal deletes it.
 
-**Mind the vocabulary.** "Six steps" sounds like six stages of a pipeline. It is a budget of six model generations, and the difference matters when you are reasoning about what gets re-sent.
+**Mind the vocabulary.** "Six steps" sounds like six stages of a pipeline. It is a budget of six model generations, and the difference matters when you reason about what gets re-sent.
 
-None of this is clever. It is the LLM equivalent of noticing a query inside a loop. But the pricing model makes it expensive in a way ordinary redundant work is not, and nothing in the developer experience points at it — the code that carries everything forward is the code that reads most naturally.
+None of this is clever. It is the LLM equivalent of a query inside a loop. But the pricing model makes it expensive in a way ordinary redundant work is not, and nothing in the developer experience points at it — the code that carries everything forward is the code that reads most naturally.
