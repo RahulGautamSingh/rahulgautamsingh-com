@@ -305,3 +305,18 @@ figure.meme { max-width: 520px; }
 }
 .quotes .who { font-size: 13.5px; color: var(--faint); padding-left: 18px; }
 .quotes .who b { color: var(--muted); font-weight: 600; }
+
+/* ---------- letter ---------- */
+
+.letter { margin: 0 0 8px; }
+.letter blockquote {
+  margin: 0 0 14px;
+  padding: 0 0 0 18px;
+  border-left: 2px solid var(--accent);
+  font-size: 16.5px;
+  line-height: 1.6;
+}
+.letter blockquote:last-of-type { margin-bottom: 10px; }
+.letter .who { font-size: 14px; color: var(--muted); padding-left: 20px; }
+.letter .who b { color: var(--fg); font-weight: 600; }
+.letter .who span { color: var(--faint); }
