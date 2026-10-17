@@ -10,7 +10,7 @@ and `[IMAGE: path | alt: text]` markers.
 import sys, os, re, html
 
 # resume.html is deliberately unlisted: reachable by URL, not in the nav.
-NAV = [("index.html", "About me"), ("articles.html", "Articles")]
+NAV = [("index.html", "About me"), ("articles.html", "Articles"), ("recommendations.html", "Recommendations")]
 
 
 def shell(title, desc, body, depth):
